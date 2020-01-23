@@ -1,99 +1,255 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/go-redis/redis"
+	"github.com/gomodule/redigo/redis"
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
+	log "github.com/sirupsen/logrus"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"html/template"
-	"log"
 	"net/http"
+	"time"
 )
 
 const cookieString string = "budget-session"
 
 type Session struct {
+	ID       string
 	Username string
 }
 
+type Budget struct {
+	Items []Item `json:"items"`
+}
+
+type Item struct {
+	ID     primitive.ObjectID `json:"_id" bson:"_id"`
+	Name   string             `json:"name"`
+	Amount int                `json:"amount"`
+	Date   int                `json:"date"`
+}
+
+type server struct {
+	port        string
+	redisURL    string
+	mongoURL    string
+	mongoClient *mongo.Client
+	redisPool   *redis.Pool
+}
+
 func main() {
+	var err error
+	s := server{
+		redisURL: "localhost:6379",
+		mongoURL: "mongodb://localhost:27017",
+	}
 
-	var port string
+	// Read port
+	flag.StringVar(&s.port, "port", "8080", "port to listen on")
 
-	flag.StringVar(&port, "port", ":8080", "port to listen on")
+	s.mongoClient, err = mongo.NewClient(options.Client().ApplyURI(s.mongoURL))
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	rClient := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-		DB:   9,
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
 
-	http.HandleFunc("/", homeHandler(auth(rClient)))
-	http.HandleFunc("/login", loginHandler(rClient))
+	err = s.mongoClient.Connect(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	http.Handle("/assets/", http.StripPrefix("/assets", http.FileServer(http.Dir("assets"))))
+	// Create redis pool
+	s.redisPool = &redis.Pool{
+		Dial: func() (redis.Conn, error) {
+			c, err := redis.Dial("tcp", s.redisURL)
+			if err != nil {
+				return nil, err
+			}
 
-	log.Println("Listening on", port)
+			if _, err := c.Do("SELECT", "1"); err != nil {
+				c.Close()
+				return nil, err
+			}
+			return c, nil
+		},
+	}
 
-	http.ListenAndServe(port, nil)
-}
+	router := mux.NewRouter()
+	router.Path("/login").HandlerFunc(s.login)
 
-func auth(client *redis.Client) func(r *http.Request) (*Session, int, error) {
+	api := router.PathPrefix("/api").Subrouter()
+	api.Methods("GET").Path("/budget").HandlerFunc(s.budget)
+	api.Methods("POST").Path("/item").HandlerFunc(s.addItem)
+	api.Use(s.auth())
 
-	return func(r *http.Request) (*Session, int, error) {
+	h := &http.Server{
+		Addr:    ":" + s.port,
+		Handler: router,
+	}
 
-		var session Session
+	log.Info("Listening on :", s.port)
 
-		// Read cookie
-		sessionCookie, err := r.Cookie(cookieString)
-		if err != nil || sessionCookie.Value == "" {
-			return nil, 401, fmt.Errorf("No session found")
-		}
-
-		// Read session
-		sessionString, err := client.Get(sessionCookie.Value).Result()
-		if err != nil {
-			return nil, 500, err
-		}
-
-		err = json.Unmarshal([]byte(sessionString), &session)
-		if err != nil {
-			return nil, 500, err
-		}
-
-		return &session, 200, nil
+	if err := h.ListenAndServe(); err != nil {
+		log.Fatal(err)
 	}
 }
 
-func loginHandler(client *redis.Client) http.HandlerFunc {
+func (s *server) auth() mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			var session Session
+			var sessionCookie string
 
-	return func(w http.ResponseWriter, r *http.Request) {
-		s := Session{"caleb"}
+			conn := s.redisPool.Get()
 
-		sessionBytes, err := json.Marshal(&s)
+			// Read cookie
+			cookies := req.Cookies()
 
-		_, err = client.Set("9801", sessionBytes, 0).Result()
-		if err != nil {
-			w.Write([]byte(err.Error()))
-			w.WriteHeader(500)
-			return
-		}
+			for i := range cookies {
+				if cookies[i].Name == cookieString {
+					sessionCookie = cookies[i].Value
+				}
+			}
 
-		http.Redirect(w, r, "/", 301)
+			if sessionCookie == "" {
+				log.Error("Session cookie was empty")
+				w.WriteHeader(401)
+				return
+			}
+
+			// Read session
+			sessionString, err := redis.String(conn.Do("GET", sessionCookie))
+			if err != nil {
+				log.Error(err)
+				w.WriteHeader(500)
+				return
+			}
+
+			err = json.Unmarshal([]byte(sessionString), &session)
+			if err != nil {
+				log.Error(err)
+				w.WriteHeader(500)
+				return
+			}
+
+			next.ServeHTTP(w, req)
+		})
 	}
+}
+
+func (s *server) budget(w http.ResponseWriter, req *http.Request) {
+	var budget Budget
+	var items []Item
+	cursor, err := s.mongoClient.Database("bank").Collection("items").Find(context.Background(), bson.D{}, options.Find())
+	if err != nil {
+		log.Error(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	if err = cursor.All(context.Background(), &items); err != nil {
+		log.Error(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	budget.Items = items
+
+	budgetJSON, err := json.Marshal(&budget)
+	if err != nil {
+		log.Error(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	w.Write([]byte(budgetJSON))
+}
+
+func (s *server) addItem(w http.ResponseWriter, req *http.Request) {
+	// Decode request into an item and save it
+	var i Item
+	err := json.NewDecoder(req.Body).Decode(&i)
+	if err != nil {
+		log.Error(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	iBson, err := bson.Marshal(&i)
+	if err != nil {
+		log.Error(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	_, err = s.mongoClient.Database("bank").Collection("items").InsertOne(context.Background(), iBson)
+	if err != nil {
+		log.Error(err)
+		w.WriteHeader(500)
+		return
+	}
+}
+
+func (s *server) login(w http.ResponseWriter, req *http.Request) {
+	conn := s.redisPool.Get()
+
+	// Parse username and password from request
+	username := req.Form.Get("username")
+	if username == "" {
+		return
+	}
+
+	password := req.Form.Get("password")
+	if password == "" {
+		return
+	}
+
+	// TODO: Validate user against db
+
+	// Ideally this would be the username from the db, not from the request
+	session := Session{
+		Username: username,
+		ID:       fmt.Sprintf("%v", uuid.New()),
+	}
+
+	// Save the session
+	sessionBytes, err := json.Marshal(&session)
+	if err != nil {
+		log.Error(err)
+
+		w.WriteHeader(500)
+		w.Write([]byte(err.Error()))
+	}
+
+	_, err = conn.Do("SET", session.ID, sessionBytes)
+	if err != nil {
+		log.Error(err)
+		w.WriteHeader(500)
+		w.Write([]byte(err.Error()))
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{Name: cookieString, Value: session.ID, Path: "/"})
 }
 
 func homeHandler(authCallback func(*http.Request) (*Session, int, error)) http.HandlerFunc {
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 		session, code, err := authCallback(r)
 		if err != nil {
-			w.Write([]byte(err.Error()))
+			log.Error(err)
 			w.WriteHeader(code)
+			w.Write([]byte(err.Error()))
 			return
 		}
-
-		http.SetCookie(w, &http.Cookie{Name: "budget-session", Value: "9801"})
 
 		log.Println("Got request to home from", session.Username)
 
@@ -109,5 +265,4 @@ func homeHandler(authCallback func(*http.Request) (*Session, int, error)) http.H
 		t.Execute(w, nil)
 
 	})
-
 }
