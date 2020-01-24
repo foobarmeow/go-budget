@@ -15,10 +15,13 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"html/template"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"time"
 )
 
 const cookieString string = "budget-session"
+const devAssetServer string = "http://localhost:9090/assets"
 
 type Session struct {
 	ID       string
@@ -26,7 +29,14 @@ type Session struct {
 }
 
 type Budget struct {
-	Items []Item `json:"items"`
+	Balances []Balance `json:"balances"`
+	Items    []Item    `json:"items"`
+}
+
+type Balance struct {
+	ID      primitive.ObjectID `json:"_id" bson:"_id"`
+	Name    string             `json:"name"`
+	Balance int                `json:"balance"`
 }
 
 type Item struct {
@@ -37,6 +47,7 @@ type Item struct {
 }
 
 type server struct {
+	devMode     bool
 	port        string
 	redisURL    string
 	mongoURL    string
@@ -49,15 +60,13 @@ func main() {
 	s := server{
 		redisURL: "localhost:6379",
 		mongoURL: "mongodb://localhost:27017",
+		devMode:  true,
 	}
 
 	// Read port
-	flag.StringVar(&s.port, "port", "8080", "port to listen on")
+	flag.StringVar(&s.port, "port", "9042", "port to listen on")
 
 	s.mongoClient, err = mongo.NewClient(options.Client().ApplyURI(s.mongoURL))
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -89,6 +98,7 @@ func main() {
 	api := router.PathPrefix("/api").Subrouter()
 	api.Methods("GET").Path("/budget").HandlerFunc(s.budget)
 	api.Methods("POST").Path("/item").HandlerFunc(s.addItem)
+	api.Use(s.cors())
 	api.Use(s.auth())
 
 	h := &http.Server{
@@ -146,6 +156,18 @@ func (s *server) auth() mux.MiddlewareFunc {
 	}
 }
 
+func (s *server) cors() mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "http://localhost:9090")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+			next.ServeHTTP(w, req)
+		})
+	}
+}
+
 func (s *server) budget(w http.ResponseWriter, req *http.Request) {
 	var budget Budget
 	var items []Item
@@ -163,6 +185,13 @@ func (s *server) budget(w http.ResponseWriter, req *http.Request) {
 	}
 
 	budget.Items = items
+	budget.Balances = []Balance{
+		{
+			ID:      primitive.NewObjectID(),
+			Name:    "WF",
+			Balance: 1900,
+		},
+	}
 
 	budgetJSON, err := json.Marshal(&budget)
 	if err != nil {
@@ -171,7 +200,10 @@ func (s *server) budget(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	w.Write([]byte(budgetJSON))
+	fmt.Println(string(budgetJSON))
+
+	w.Header().Add("Content-Type", "application/json")
+	w.Write(budgetJSON)
 }
 
 func (s *server) addItem(w http.ResponseWriter, req *http.Request) {
@@ -183,6 +215,8 @@ func (s *server) addItem(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(500)
 		return
 	}
+
+	i.ID = primitive.NewObjectID()
 
 	iBson, err := bson.Marshal(&i)
 	if err != nil {
@@ -239,6 +273,26 @@ func (s *server) login(w http.ResponseWriter, req *http.Request) {
 	}
 
 	http.SetCookie(w, &http.Cookie{Name: cookieString, Value: session.ID, Path: "/"})
+}
+
+func (s *server) home(w http.ResponseWriter, req *http.Request) {
+	if s.devMode {
+		// Serve from the asset server
+		url, _ := url.Parse(devAssetServer)
+
+		// create the reverse proxy
+		proxy := httputil.NewSingleHostReverseProxy(url)
+
+		// Update the headers to allow for SSL redirection
+		req.URL.Host = url.Host
+		req.URL.Scheme = url.Scheme
+		req.Header.Set("X-Forwarded-Host", req.Header.Get("Host"))
+		req.Host = url.Host
+
+		fmt.Println("PROXY", req.URL.String())
+
+		proxy.ServeHTTP(w, req)
+	}
 }
 
 func homeHandler(authCallback func(*http.Request) (*Session, int, error)) http.HandlerFunc {
